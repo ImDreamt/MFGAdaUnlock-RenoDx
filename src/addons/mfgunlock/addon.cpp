@@ -1,0 +1,1207 @@
+/*
+ * RenoDX MFG Unlock
+ * SPDX-License-Identifier: MIT
+ *
+ * Makes DLSS multi-frame generation (3x and above) available on Ada (RTX 40),
+ * which NVIDIA ships gated to Blackwell (RTX 50) only -- and corrects the
+ * interpolation so the extra frames carry new motion instead of repeats.
+ *
+ * Nothing on disk is modified. Every patch is applied to the mapped image and
+ * reverted on unload.
+ *
+ * ---------------------------------------------------------------------------
+ * LAYOUT
+ *
+ *   this file      arch gates, flip metering, the plugin's frame ceiling,
+ *                  config, overlay, and the fallback parameter override
+ *   midpoint.hpp   the temporal fix -- fatbin/PTX rewrite
+ *   framecount.hpp forcing numFramesToGenerate through slDLSSGSetOptions
+ *   loadhook.hpp   catching the snippet as it is mapped
+ *   ngx_hook.hpp   thread-safe Detours installer
+ *
+ * Each of those carries its own commentary. What follows is this file only.
+ *
+ * ---------------------------------------------------------------------------
+ * HOW THE CAPABILITY IS DECIDED -- three gates, outermost first
+ *
+ * 1. Which GPUs the snippet claims at all. nvngx_dlssg.dll exports
+ *
+ *        NVSDK_NGX_GetGPUArchitecture:   mov eax, 0x190   ; Ada
+ *                                        ret
+ *
+ *    a hardcoded minimum architecture that NGX reads before anything else. It
+ *    matches each snippet's published hardware requirement exactly --
+ *    nvngx_dlss 0x160 (Turing), nvngx_dlssg 0x190 (Ada), nvngx_dlssnr 0x1b0
+ *    (Blackwell). A 40-series card already clears this one, so it is left
+ *    alone; it is documented because it is the first thing to read when a
+ *    feature is missing *entirely* rather than merely limited.
+ *
+ * 2. How many frames the snippet advertises, in
+ *    DLSSGInstanceManager::PopulateParameters:
+ *
+ *        cmp ebp, 0x1b0        ; NVAPI arch id, 0x1b0 == GB20x (RTX 50)
+ *        jl  <not supported>   ; anything below -->
+ *        mov edi, 5            ;   Blackwell: max frame count 5
+ *        ...
+ *        <not supported>: mov edi, 1
+ *        ... Set("DLSSG.MultiFrameCountMax", edi)
+ *
+ * 3. A second compare against the same constant, feeding a runtime capability
+ *    flag that drives generation itself:
+ *
+ *        cmp   eax, 0x1b0
+ *        setae al
+ *        mov   byte ptr [rdi+0x28], al
+ *
+ *    Patching (2) without (3) is the worst of both: the options appear, the
+ *    runtime accepts the request, and the game renders black.
+ *
+ * So this addon rewrites 0x1b0 -> 0x190 at every *compare*, in both encodings
+ * (3D imm32 and 81 /7 imm32), and deliberately leaves `mov r32, 0x1b0` alone --
+ * that is the arch-id lookup table, not a gate.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE MAPPED IMAGE AND NEVER THE FILE
+ *
+ * NGX verifies the snippet's Authenticode signature when it LOADS it, so the
+ * same bytes changed on disk make frame generation disappear altogether. The
+ * mapped copy is never re-checked.
+ *
+ * ---------------------------------------------------------------------------
+ * THE PARAMETER OVERRIDE (kept, but not what does the work)
+ *
+ * NVSDK_NGX_*_GetParameters / GetCapabilityParameters are also hooked, and slot
+ * 11 of the returned object's vtable -- Get(const char*, unsigned int*) -- is
+ * replaced so "DLSSG.MultiFrameCountMax" can be answered directly.
+ * NVSDK_NGX_Parameter declares 8 Set overloads before its 8 Get overloads,
+ * which is where that slot number comes from.
+ *
+ * This was the original approach, and it does not work with Streamline:
+ * sl.dlss_g builds its own NVSDK_NGX_Parameter rather than passing NGX's along,
+ * so the patch arms and never fires. It is kept because it costs nothing and is
+ * the only lever for an NGX consumer that is not Streamline. The arch gates
+ * above are what actually does the job in every game tested.
+ *
+ * ---------------------------------------------------------------------------
+ * PACING
+ *
+ * Blackwell paces multi-frame output with hardware flip metering that Ada does
+ * not have; left enabled, 3x+ freezes the presented image while audio keeps
+ * running. Streamline already ships the software fallback, so the addon only
+ * has to force the plugin down it -- see TryPatchFlipMeteringInModule, which
+ * derives the field's offset AND its polarity at runtime because both move
+ * between plugin builds.
+ *
+ * None of this makes multi-frame generation correct by NVIDIA's standards on
+ * hardware they did not ship it for. It makes it run, and midpoint.hpp makes it
+ * look right; the rest is judged by eye.
+ */
+
+#define ImTextureID ImU64
+
+#include <windows.h>
+
+#include <atomic>
+#include <cstring>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <d3d11.h>
+#include <d3d12.h>
+
+#include <nvsdk_ngx.h>
+
+#include <deps/imgui/imgui.h>
+#include <include/reshade.hpp>
+
+#include "./framecount.hpp"
+#include "./loadhook.hpp"
+#include "./midpoint.hpp"
+#include "./ngx_hook.hpp"
+
+namespace {
+
+constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
+constexpr const char* kParamName = "DLSSG.MultiFrameCountMax";
+
+// Slot 11 of NVSDK_NGX_Parameter == Get(const char*, unsigned int*).
+constexpr size_t kGetUInt32Slot = 11;
+
+constexpr unsigned int kMinCount = 2;
+constexpr unsigned int kMaxCount = 5;
+
+std::atomic_bool g_enabled{true};
+std::atomic<unsigned int> g_max_count{4};
+std::atomic_bool g_force_flip_meter_off{true};
+std::atomic_bool g_temporal_fix{true};
+// Raising the plugin's own clamp broke GTA V Enhanced -- its 2.9.1.0 plugin was
+// only ever shipped bounded at 3, and lifting that is not the same as it being
+// able to cope. Off by default; updating the plugin is the sound fix.
+std::atomic_bool g_raise_ceiling{false};
+
+// Our own image. Both marker scans look for strings that are, necessarily,
+// string literals inside this very DLL -- so without excluding ourselves the
+// scan happily identifies the addon as the DLSS-G plugin and then fails to
+// make sense of it. Harmless where the real plugin is enumerated first;
+// fatal where it is not loaded at all.
+HMODULE g_self_module = nullptr;
+
+std::atomic_bool g_vtable_patched{false};
+std::atomic_bool g_override_reported{false};
+std::atomic<unsigned int> g_override_hits{0};
+std::atomic<unsigned int> g_runtime_reported_value{0};
+
+void** g_patched_slot = nullptr;
+void* g_original_slot_value = nullptr;
+
+using GetUInt32Fn = NVSDK_NGX_Result (*)(void* self, const char* name, unsigned int* out);
+GetUInt32Fn g_real_get_uint32 = nullptr;
+
+bool NgxFailed(NVSDK_NGX_Result result) {
+  return (static_cast<unsigned int>(result) & 0xfff00000u) == 0xbad00000u;
+}
+
+NVSDK_NGX_Result HookedGetUInt32(void* self, const char* name, unsigned int* out) {
+  NVSDK_NGX_Result result = g_real_get_uint32(self, name, out);
+
+  if (!g_enabled.load(std::memory_order_relaxed)) return result;
+  if (name == nullptr || out == nullptr) return result;
+  if (std::strcmp(name, kParamName) != 0) return result;
+
+  const bool failed = NgxFailed(result);
+  const unsigned int reported = failed ? 0u : *out;
+  const unsigned int want = g_max_count.load(std::memory_order_relaxed);
+
+  g_runtime_reported_value.store(reported, std::memory_order_relaxed);
+
+  // Never lower a value the runtime already offers.
+  if (!failed && reported >= want) return result;
+
+  *out = want;
+  g_override_hits.fetch_add(1, std::memory_order_relaxed);
+
+  if (!g_override_reported.exchange(true, std::memory_order_relaxed)) {
+    std::stringstream s;
+    s << "mfgunlock: " << kParamName << " came back as ";
+    if (failed) {
+      s << "a failure (0x" << std::hex << static_cast<unsigned int>(result) << std::dec << ")";
+    } else {
+      s << reported;
+    }
+    s << "; reporting " << want << " instead.";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
+  return NVSDK_NGX_Result_Success;
+}
+
+bool PatchParameterVTable(NVSDK_NGX_Parameter* params) {
+  if (params == nullptr) return false;
+  if (g_vtable_patched.load(std::memory_order_acquire)) return true;
+
+  auto** vtable = *reinterpret_cast<void***>(params);
+  if (vtable == nullptr) return false;
+  void** slot = &vtable[kGetUInt32Slot];
+
+  DWORD old_protect = 0;
+  if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect) == 0) {
+    reshade::log::message(reshade::log::level::error,
+                          "mfgunlock: could not make the NGX parameter vtable writable.");
+    return false;
+  }
+
+  g_original_slot_value = *slot;
+  g_real_get_uint32 = reinterpret_cast<GetUInt32Fn>(g_original_slot_value);
+  *slot = reinterpret_cast<void*>(&HookedGetUInt32);
+  g_patched_slot = slot;
+
+  DWORD ignored = 0;
+  VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
+
+  g_vtable_patched.store(true, std::memory_order_release);
+  reshade::log::message(
+      reshade::log::level::info,
+      "mfgunlock: NGX parameter vtable patched; multi-frame capability override armed.");
+  return true;
+}
+
+void RestoreParameterVTable() {
+  if (!g_vtable_patched.load(std::memory_order_acquire)) return;
+  if (g_patched_slot == nullptr || g_original_slot_value == nullptr) return;
+
+  DWORD old_protect = 0;
+  if (VirtualProtect(g_patched_slot, sizeof(void*), PAGE_READWRITE, &old_protect) != 0) {
+    *g_patched_slot = g_original_slot_value;
+    DWORD ignored = 0;
+    VirtualProtect(g_patched_slot, sizeof(void*), old_protect, &ignored);
+  }
+  g_vtable_patched.store(false, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------- NGX entries
+
+using NgxParamsOutFn = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter**);
+
+NgxParamsOutFn g_real_allocate_parameters = nullptr;
+NgxParamsOutFn g_real_get_capability_parameters = nullptr;
+NgxParamsOutFn g_real_get_device_capability_parameters = nullptr;
+NgxParamsOutFn g_real_get_parameters = nullptr;
+
+NVSDK_NGX_Result NVSDK_CONV HookedAllocateParameters(NVSDK_NGX_Parameter** out_parameters) {
+  NVSDK_NGX_Result result = g_real_allocate_parameters(out_parameters);
+  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
+  return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV HookedGetCapabilityParameters(NVSDK_NGX_Parameter** out_parameters) {
+  NVSDK_NGX_Result result = g_real_get_capability_parameters(out_parameters);
+  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
+  return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV HookedGetDeviceCapabilityParameters(
+    NVSDK_NGX_Parameter** out_parameters) {
+  NVSDK_NGX_Result result = g_real_get_device_capability_parameters(out_parameters);
+  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
+  return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV HookedGetParameters(NVSDK_NGX_Parameter** out_parameters) {
+  NVSDK_NGX_Result result = g_real_get_parameters(out_parameters);
+  if (!NgxFailed(result) && out_parameters != nullptr) PatchParameterVTable(*out_parameters);
+  return result;
+}
+
+// All four hand out a parameter block, and which one Streamline uses for the
+// capability query is not something we can know from outside. They all live in
+// the NGX loader, so hooking the set costs nothing extra -- and missing the one
+// that is actually used would look exactly like the addon doing nothing.
+const std::vector<mfgunlock::hook::HookItem> kNgxHooks = {
+    {"NVSDK_NGX_D3D12_AllocateParameters",
+     reinterpret_cast<void**>(&g_real_allocate_parameters),
+     reinterpret_cast<void*>(&HookedAllocateParameters)},
+    {"NVSDK_NGX_D3D12_GetCapabilityParameters",
+     reinterpret_cast<void**>(&g_real_get_capability_parameters),
+     reinterpret_cast<void*>(&HookedGetCapabilityParameters)},
+    {"NVSDK_NGX_D3D12_GetDeviceCapabilityParameters",
+     reinterpret_cast<void**>(&g_real_get_device_capability_parameters),
+     reinterpret_cast<void*>(&HookedGetDeviceCapabilityParameters)},
+    {"NVSDK_NGX_D3D12_GetParameters",
+     reinterpret_cast<void**>(&g_real_get_parameters),
+     reinterpret_cast<void*>(&HookedGetParameters)},
+};
+
+// Only the NGX loader hands out parameter blocks; the feature snippets do not
+// export these.
+constexpr const wchar_t* kNgxModules[] = {L"_nvngx.dll", L"nvngx.dll"};
+
+std::atomic_bool g_hooked{false};
+int g_hook_attempts = 0;
+constexpr int kMaxHookAttempts = 8;
+
+// Resolved, not hooked -- used only to hand back the block we allocate below.
+NgxParamsOutFn g_real_destroy_parameters = nullptr;
+
+void TryInstallHooks() {
+  if (g_hooked.load(std::memory_order_acquire)) return;
+  if (g_hook_attempts >= kMaxHookAttempts) return;
+
+  for (const auto* name : kNgxModules) {
+    HMODULE mod = GetModuleHandleW(name);
+    if (mod == nullptr) continue;
+    if (GetProcAddress(mod, "NVSDK_NGX_D3D12_AllocateParameters") == nullptr) continue;
+
+    ++g_hook_attempts;
+    char narrow[64] = {};
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+    if (!mfgunlock::hook::Install(mod, kNgxHooks, narrow)) continue;
+
+    g_real_destroy_parameters = reinterpret_cast<NgxParamsOutFn>(
+        reinterpret_cast<void*>(GetProcAddress(mod, "NVSDK_NGX_D3D12_DestroyParameters")));
+
+    g_hooked.store(true, std::memory_order_release);
+    return;
+  }
+}
+
+// Every parameter object shares one vtable, so we do not have to wait for the
+// game to hand us one: allocate a throwaway block ourselves, take the vtable
+// from it, and give it straight back. Before NGX is initialised this just
+// returns an error and we retry on the next present.
+//
+// Waiting passively would mean the override arms only once DLSS-G is already
+// initialising, which is a race against the very query we want to answer.
+int g_bootstrap_attempts = 0;
+constexpr int kMaxBootstrapAttempts = 2000;
+
+void TryBootstrapVTable() {
+  if (g_vtable_patched.load(std::memory_order_acquire)) return;
+  if (!g_hooked.load(std::memory_order_acquire)) return;
+  if (g_real_allocate_parameters == nullptr) return;
+  if (g_bootstrap_attempts >= kMaxBootstrapAttempts) return;
+  ++g_bootstrap_attempts;
+
+  NVSDK_NGX_Parameter* params = nullptr;
+  NVSDK_NGX_Result result = g_real_allocate_parameters(&params);
+  if (NgxFailed(result) || params == nullptr) return;
+
+  PatchParameterVTable(params);
+
+  if (g_real_destroy_parameters != nullptr) {
+    reinterpret_cast<NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*)>(
+        reinterpret_cast<void*>(g_real_destroy_parameters))(params);
+  }
+}
+
+// ------------------------------------------------------- in-memory arch gate
+//
+// The read-side override assumes Streamline reads the capability through the
+// NGX loader's parameter object. It does not: the vtable patch arms fine and
+// then never fires, because sl.* carries its own NVSDK_NGX_Parameter
+// implementation and we never see that vtable.
+//
+// So patch the decision instead of the answer. NGX verifies the snippet's
+// Authenticode signature when it LOADS the file -- which is why the on-disk
+// byte patch made frame generation disappear entirely. Editing the same bytes
+// in the mapped image afterwards is never re-checked, so the signed DLL loads
+// and then behaves like the patched one.
+//
+// The instruction, in DLSSGInstanceManager::PopulateParameters:
+//     81 FD B0 01 00 00     cmp ebp, 0x1b0     ; arch id, 0x1b0 == GB20x
+// Exactly one occurrence in .text of 310.8, which is what makes this safe to
+// find by pattern. 0x1b0 -> 0x190 lets AD10x take the Blackwell path.
+
+// nvngx_dlssg.dll gates multi-frame on the NVAPI arch id in more than one
+// place, and they do different jobs:
+//
+//   DLSSGInstanceManager::PopulateParameters   -- decides what to advertise
+//     81 FD B0 01 00 00   cmp ebp, 0x1b0     ; 0x1b0 == GB20x (RTX 50)
+//     jl  <report max = 1>
+//
+//   ...and a separate runtime capability flag that drives generation itself:
+//     3D B0 01 00 00      cmp eax, 0x1b0
+//     0F 93 C0            setae al
+//     88 47 28            mov byte ptr [rdi+0x28], al
+//
+// Patching only the first is what produced 3x/4x rendering black: the runtime
+// advertised multi-frame, accepted the request, and then took the non-Blackwell
+// path when actually generating, so the extra frames were presented empty.
+//
+// So rewrite every comparison against the Blackwell arch id, in both encodings.
+// 0x1b0 is a specific NVAPI arch constant, and any compare against it in this
+// DLL is an arch gate -- but a `mov r32, 0x1b0` is the arch-id lookup table
+// returning Blackwell's own id, which must be left alone. Only `cmp` forms are
+// rewritten.
+//
+// NGX verifies the snippet's Authenticode signature when it LOADS the file --
+// which is why patching the same bytes on disk made frame generation vanish.
+// The mapped image is never re-checked, so the signed DLL loads and then
+// behaves as patched.
+
+// ------------------------------------------------ locating the DLSS-G snippet
+//
+// Finding it as GetModuleHandleW(L"nvngx_dlssg.dll") is the same mistake that
+// already cost us a silent no-op on the Streamline side: NGX can load the
+// snippet from the driver's OTA store, and a game may stage it under another
+// path. The name is a fast path, not a contract.
+//
+// Fall back to identifying it by content -- the module carrying the
+// "dlfg_kernel" descriptor name is the DLSS-G snippet whatever it is called.
+// The scan walks every loaded module, so it is throttled: the fast path runs
+// every call, the scan only every kScanInterval attempts.
+
+constexpr char kDlssgMarker[] = "dlfg_kernel";
+constexpr int kScanInterval = 60;
+
+bool ModuleContains(HMODULE mod, const char* needle, size_t needle_len) {
+  auto* base = reinterpret_cast<unsigned char*>(mod);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (IsBadReadPtr(base, sizeof(IMAGE_DOS_HEADER)) != 0) return false;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+  if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+
+  const auto* section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < needle_len) continue;
+    for (size_t off = 0; off + needle_len <= size; ++off) {
+      if (std::memcmp(start + off, needle, needle_len) == 0) return true;
+    }
+  }
+  return false;
+}
+
+HMODULE FindDlssgModule(int attempts) {
+  if (HMODULE fast = GetModuleHandleW(L"nvngx_dlssg.dll")) return fast;
+  if (attempts % kScanInterval != 0) return nullptr;
+
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snap == INVALID_HANDLE_VALUE) return nullptr;
+  HMODULE found = nullptr;
+  MODULEENTRY32W me = {};
+  me.dwSize = sizeof(me);
+  if (Module32FirstW(snap, &me)) {
+    do {
+      if (me.hModule == g_self_module) continue;
+      if (ModuleContains(me.hModule, kDlssgMarker, sizeof(kDlssgMarker) - 1)) {
+        found = me.hModule;
+        break;
+      }
+    } while (Module32NextW(snap, &me));
+  }
+  CloseHandle(snap);
+  return found;
+}
+
+constexpr unsigned char kArchOld = 0xB0;  // 0x1b0 GB20x
+constexpr unsigned char kArchNew = 0x90;  // 0x190 AD10x
+
+struct GateSite {
+  unsigned char* address;  // the byte holding the arch id's low octet
+  unsigned char original;
+};
+
+std::atomic_bool g_gate_patched{false};
+std::vector<GateSite> g_gate_sites;
+int g_gate_attempts = 0;
+constexpr int kMaxGateAttempts = 200000;
+
+// Split out so the load-time trigger can patch a module it already holds a
+// handle to. That path runs under the loader lock, where CreateToolhelp32Snapshot
+// (which FindDlssgModule uses) would deadlock -- so it must never scan.
+void PatchArchGatesInModule(HMODULE mod) {
+  if (g_gate_patched.load(std::memory_order_acquire)) return;
+  if (mod == nullptr) return;
+
+  auto* base = reinterpret_cast<unsigned char*>(mod);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+  std::vector<unsigned char*> found;
+  const auto* section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < 6) continue;
+    for (size_t off = 0; off + 6 <= size; ++off) {
+      // 3D id32            cmp eax, imm32
+      if (start[off] == 0x3D && start[off + 1] == kArchOld && start[off + 2] == 0x01 &&
+          start[off + 3] == 0x00 && start[off + 4] == 0x00) {
+        found.push_back(start + off + 1);
+        continue;
+      }
+      // 81 /7 id32         cmp r32, imm32
+      if (start[off] == 0x81 && start[off + 1] >= 0xF8 && start[off + 1] <= 0xFF &&
+          start[off + 2] == kArchOld && start[off + 3] == 0x01 && start[off + 4] == 0x00 &&
+          start[off + 5] == 0x00) {
+        found.push_back(start + off + 2);
+      }
+    }
+  }
+
+  if (found.empty() || found.size() > 4) {
+    if (g_gate_attempts >= kMaxGateAttempts || found.size() > 4) {
+      std::stringstream s;
+      s << "mfgunlock: found " << found.size()
+        << " arch-gate comparisons in nvngx_dlssg.dll (expected 1-4); leaving it alone.";
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      g_gate_attempts = kMaxGateAttempts;
+    }
+    return;
+  }
+
+  for (unsigned char* site : found) {
+    DWORD old_protect = 0;
+    if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &old_protect) == 0) continue;
+    g_gate_sites.push_back({site, *site});
+    *site = kArchNew;
+    DWORD ignored = 0;
+    VirtualProtect(site, 1, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site, 1);
+  }
+
+  if (g_gate_sites.empty()) {
+    reshade::log::message(reshade::log::level::error,
+                          "mfgunlock: could not make the nvngx_dlssg.dll arch gates writable.");
+    g_gate_attempts = kMaxGateAttempts;
+    return;
+  }
+  g_gate_patched.store(true, std::memory_order_release);
+
+  char module_path[MAX_PATH] = {};
+  GetModuleFileNameA(mod, module_path, MAX_PATH);
+  std::stringstream s;
+  s << "mfgunlock: rewrote " << g_gate_sites.size() << " arch gate(s) (0x1b0 -> 0x190) in "
+    << module_path << "; multi-frame should report as supported AND generate.";
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+}
+
+void TryPatchDlssgArchGate() {
+  if (g_gate_patched.load(std::memory_order_acquire)) return;
+  if (g_gate_attempts >= kMaxGateAttempts) return;
+  HMODULE mod = FindDlssgModule(g_gate_attempts);
+  ++g_gate_attempts;
+  if (mod == nullptr) return;
+  PatchArchGatesInModule(mod);
+}
+
+void RestoreDlssgArchGate() {
+  if (!g_gate_patched.load(std::memory_order_acquire)) return;
+  for (const auto& site : g_gate_sites) {
+    DWORD old_protect = 0;
+    if (VirtualProtect(site.address, 1, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
+      *site.address = site.original;
+      DWORD ignored = 0;
+      VirtualProtect(site.address, 1, old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), site.address, 1);
+    }
+  }
+  g_gate_sites.clear();
+  g_gate_patched.store(false, std::memory_order_release);
+}
+
+// ------------------------------------------------------ temporal (midpoint)
+//
+// Unlocking the multipliers gets the right NUMBER of generated frames; this
+// gets the right CONTENT. Without it every generated frame is the same 0.5
+// blend, so 4x shows three identical half-way frames and the motion is no
+// smoother than 2x despite double the counter. See midpoint.hpp.
+
+std::atomic_bool g_midpoint_patched{false};
+std::vector<mfgunlock::midpoint::Patch> g_midpoint_patches;
+void* g_midpoint_allocation = nullptr;
+std::string g_midpoint_detail;
+int g_midpoint_attempts = 0;
+constexpr int kMaxMidpointAttempts = 200000;
+
+void PatchMidpointInModule(HMODULE mod) {
+  if (g_midpoint_patched.load(std::memory_order_acquire)) return;
+  if (mod == nullptr) return;
+
+  std::string detail;
+  if (!mfgunlock::midpoint::Apply(mod, g_midpoint_patches, g_midpoint_allocation, detail)) {
+    // One retry per frame is pointless if the module is present but the layout
+    // is not what we understand -- say so once and stop.
+    if (!detail.empty() && detail != "no dlfg_kernel descriptor found") {
+      std::stringstream s;
+      s << "mfgunlock: temporal fix not applied -- " << detail << ".";
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      g_midpoint_attempts = kMaxMidpointAttempts;
+    }
+    return;
+  }
+
+  g_midpoint_detail = detail;
+  g_midpoint_patched.store(true, std::memory_order_release);
+  std::stringstream s;
+  s << "mfgunlock: temporal fix applied -- " << detail
+    << "; generated frames should now land at their own time, not all at the midpoint.";
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+}
+
+void TryPatchMidpoint() {
+  if (g_midpoint_patched.load(std::memory_order_acquire)) return;
+  if (g_midpoint_attempts >= kMaxMidpointAttempts) return;
+  HMODULE mod = FindDlssgModule(g_midpoint_attempts);
+  ++g_midpoint_attempts;
+  if (mod == nullptr) return;
+  PatchMidpointInModule(mod);
+}
+
+void RestoreMidpoint() {
+  if (!g_midpoint_patched.load(std::memory_order_acquire)) return;
+  mfgunlock::midpoint::Restore(g_midpoint_patches, g_midpoint_allocation);
+  g_midpoint_patched.store(false, std::memory_order_release);
+}
+
+// ------------------------------------------------- flip metering (sl.dlss_g)
+//
+// With the gate open, 2x works but 3x/4x freeze the display while audio keeps
+// running -- frames are generated and never reach the screen. Blackwell paces
+// multi-frame output with hardware flip metering; Ada has none, so the present
+// queue waits on something that never happens.
+//
+// Streamline already ships the fallback. sl.dlss_g/ngx.cpp logs
+// "FG1 DLL has been detected: forcing flip-metering off." and writes a flag on
+// the DLSS-G context, dropping it onto the software RSYNC pacer in rsync.cpp.
+// That is the path Ada needs.
+//
+// Two things make this impossible to hardcode, both learned the hard way:
+//
+//  1. The plugin in bin/x64 is usually NOT the one running. Streamline
+//     OTA-updates its plugins into
+//     C:\ProgramData\NVIDIA\NGX\models\sl_dlss_g_0\versions\<n>\files\<hash>.dll
+//     so GetModuleHandleW(L"sl.dlss_g.dll") finds nothing and a name-based patch
+//     silently does nothing at all -- no error, no log line, no effect.
+//
+//  2. The flag's offset AND ITS POLARITY differ between builds. The game-folder
+//     build clears [ctx+0x38bc] to mean "flip metering off"; the OTA build sets
+//     [ctx+0x44f8] to 1 to mean the same thing. A hardcoded value is a coin flip
+//     that silently does the opposite half the time.
+//
+// So derive everything from the binary: find the module carrying the marker
+// string, find the code that logs it, and read the (offset, value) the fallback
+// itself writes. That pair IS the wanted state, whatever its polarity. Then flip
+// every other site writing that offset to match.
+
+constexpr char kFlipMarker[] = "FG1 DLL has been detected";
+
+struct FlipSite {
+  unsigned char* address;
+  unsigned char original;
+};
+
+std::atomic_bool g_flip_meter_patched{false};
+std::vector<FlipSite> g_flip_meter_sites;
+std::atomic<unsigned int> g_flip_meter_offset{0};
+std::atomic<unsigned int> g_flip_meter_value{0};
+int g_flip_meter_attempts = 0;
+constexpr int kMaxFlipMeterAttempts = 4000;
+
+bool ModuleImage(HMODULE mod, unsigned char** out_base, const IMAGE_NT_HEADERS64** out_nt) {
+  if (mod == nullptr) return false;
+  auto* base = reinterpret_cast<unsigned char*>(mod);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+  if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+  *out_base = base;
+  *out_nt = nt;
+  return true;
+}
+
+// ------------------------------------------- Streamline's own frame ceiling
+//
+// The plugin clamps the requested generated-frame count to its own maximum,
+// independently of anything the snippet advertises:
+//
+//     BA 03 00 00 00   mov   edx, 3
+//     3B CA            cmp   ecx, edx
+//     0F 42 D1         cmovb edx, ecx      ; edx = min(count, 3)
+//
+// The immediate is the ceiling in GENERATED frames, so 3 == 4x and 5 == 6x.
+// Builds differ: the plugin GTA V Enhanced bundles (sl.dlss_g 2.9.1.0) clamps
+// at 3, while the OTA build Cyberpunk and Deep Rock Galactic load clamps at 5.
+// That is why forcing 5x/6x silently did nothing in GTA V Enhanced and worked
+// elsewhere -- the request was being clipped before it ever reached the
+// snippet.
+//
+// Raise the immediate rather than NOP the cmovb: keeping the clamp means the
+// count is still bounded, just bounded where the newer plugin bounds it.
+
+constexpr unsigned char kCeilingTarget = 5;  // generated frames == 6x
+
+std::atomic_bool g_ceiling_patched{false};
+unsigned char* g_ceiling_site = nullptr;
+unsigned char g_ceiling_original = 0;
+
+void PatchFrameCountCeiling(HMODULE mod) {
+  if (g_ceiling_patched.load(std::memory_order_acquire)) return;
+
+  unsigned char* base = nullptr;
+  const IMAGE_NT_HEADERS64* nt = nullptr;
+  if (!ModuleImage(mod, &base, &nt)) return;
+
+  const unsigned char tail[] = {0x3B, 0xCA, 0x0F, 0x42, 0xD1};
+  unsigned char* found = nullptr;
+  size_t hits = 0;
+  const auto* section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < 10) continue;
+    for (size_t off = 0; off + 10 <= size; ++off) {
+      if (start[off] != 0xBA) continue;
+      if (start[off + 2] != 0 || start[off + 3] != 0 || start[off + 4] != 0) continue;
+      if (std::memcmp(start + off + 5, tail, sizeof(tail)) != 0) continue;
+      const unsigned char ceiling = start[off + 1];
+      if (ceiling == 0 || ceiling > 8) continue;
+      if (found == nullptr) found = start + off + 1;
+      ++hits;
+    }
+  }
+
+  if (hits != 1 || found == nullptr) {
+    if (hits > 1) {
+      std::stringstream s;
+      s << "mfgunlock: found " << hits
+        << " frame-count clamps in the DLSS-G plugin (expected 1); leaving them alone.";
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    }
+    return;
+  }
+
+  if (*found >= kCeilingTarget) {
+    // Already as permissive as we would make it -- nothing to do, and saying so
+    // is more useful than silence when someone wonders why there is no log line.
+    std::stringstream s;
+    s << "mfgunlock: DLSS-G plugin already allows " << static_cast<unsigned int>(*found)
+      << " generated frame(s) (" << (static_cast<unsigned int>(*found) + 1)
+      << "x); leaving its ceiling alone.";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    g_ceiling_patched.store(true, std::memory_order_release);
+    return;
+  }
+
+  DWORD old_protect = 0;
+  if (VirtualProtect(found, 1, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return;
+  g_ceiling_original = *found;
+  g_ceiling_site = found;
+  *found = kCeilingTarget;
+  DWORD ignored = 0;
+  VirtualProtect(found, 1, old_protect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), found, 1);
+  g_ceiling_patched.store(true, std::memory_order_release);
+
+  std::stringstream s;
+  s << "mfgunlock: raised the DLSS-G plugin's frame-count ceiling from "
+    << static_cast<unsigned int>(g_ceiling_original) << " to "
+    << static_cast<unsigned int>(kCeilingTarget) << " generated frame(s) ("
+    << (static_cast<unsigned int>(g_ceiling_original) + 1) << "x -> "
+    << (static_cast<unsigned int>(kCeilingTarget) + 1) << "x).";
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+}
+
+void RestoreFrameCountCeiling() {
+  if (!g_ceiling_patched.load(std::memory_order_acquire)) return;
+  if (g_ceiling_site == nullptr || g_ceiling_original == 0) return;
+  DWORD old_protect = 0;
+  if (VirtualProtect(g_ceiling_site, 1, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
+    *g_ceiling_site = g_ceiling_original;
+    DWORD ignored = 0;
+    VirtualProtect(g_ceiling_site, 1, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), g_ceiling_site, 1);
+  }
+  g_ceiling_site = nullptr;
+  g_ceiling_patched.store(false, std::memory_order_release);
+}
+
+// Handles the DLSS-G Streamline plugin wherever it was loaded from. Returns true
+// once a module has been dealt with, so the caller stops scanning.
+bool TryPatchFlipMeteringInModule(HMODULE mod) {
+  unsigned char* base = nullptr;
+  const IMAGE_NT_HEADERS64* nt = nullptr;
+  if (!ModuleImage(mod, &base, &nt)) return false;
+
+  // 1. Is this the DLSS-G plugin? The marker string identifies it regardless of
+  //    what the OTA layer decided to call the file.
+  const size_t marker_len = sizeof(kFlipMarker) - 1;
+  const unsigned char* marker = nullptr;
+  const auto* section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections && marker == nullptr; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < marker_len) continue;
+    for (size_t off = 0; off + marker_len <= size; ++off) {
+      if (std::memcmp(start + off, kFlipMarker, marker_len) == 0) {
+        marker = start + off;
+        break;
+      }
+    }
+  }
+  if (marker == nullptr) return false;
+
+  ++g_flip_meter_attempts;
+
+  // 2. Find the code referencing it, then read the (offset, value) the fallback
+  //    writes: C6 /r disp32 imm8 == mov byte ptr [reg+disp32], imm8.
+  unsigned int want_offset = 0;
+  int want_value = -1;
+  section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections && want_value < 0; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < 8) continue;
+    for (size_t off = 0; off + 8 <= size && want_value < 0; ++off) {
+      // lea reg, [rip+disp32] pointing at the marker string
+      if (!(start[off] == 0x48 || start[off] == 0x4C)) continue;
+      if (start[off + 1] != 0x8D) continue;
+      if ((start[off + 2] & 0xC7) != 0x05) continue;
+      int disp = 0;
+      std::memcpy(&disp, start + off + 3, sizeof(disp));
+      if (start + off + 7 + disp != marker) continue;
+
+      const size_t window = 0x200;
+      const size_t limit = (off + window < size) ? (off + window) : size;
+      for (size_t w = off; w + 7 <= limit; ++w) {
+        if (start[w] != 0xC6) continue;
+        if (start[w + 1] < 0x80 || start[w + 1] > 0xBF) continue;  // mod=10, disp32
+        unsigned int field = 0;
+        std::memcpy(&field, start + w + 2, sizeof(field));
+        const unsigned char imm = start[w + 6];
+        if (field <= 0x100 || field >= 0x20000) continue;
+        if (imm > 1) continue;
+        want_offset = field;
+        want_value = imm;
+        break;
+      }
+    }
+  }
+
+  if (want_value < 0) {
+    // Name the module. Which DLSS-G plugin is actually loaded varies wildly --
+    // game-bundled, driver OTA, or an NVIDIA App override copy -- and without
+    // the path this warning says nothing actionable.
+    char module_path[MAX_PATH] = {};
+    GetModuleFileNameA(mod, module_path, MAX_PATH);
+    std::stringstream s;
+    s << "mfgunlock: located a DLSS-G plugin (" << module_path
+      << ") but could not read its flip-metering fallback state; leaving it alone.";
+    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    g_flip_meter_attempts = kMaxFlipMeterAttempts;
+    return true;
+  }
+
+  // 3. Flip every site writing the opposite value to that same field.
+  const unsigned char opposite = static_cast<unsigned char>(1 - want_value);
+  section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    unsigned char* start = base + section->VirtualAddress;
+    const size_t size = section->Misc.VirtualSize;
+    if (size < 7) continue;
+    for (size_t off = 0; off + 7 <= size; ++off) {
+      if (start[off] != 0xC6) continue;
+      if (start[off + 1] < 0x80 || start[off + 1] > 0xBF) continue;
+      unsigned int field = 0;
+      std::memcpy(&field, start + off + 2, sizeof(field));
+      if (field != want_offset) continue;
+      if (start[off + 6] != opposite) continue;
+
+      unsigned char* site = start + off + 6;
+      DWORD old_protect = 0;
+      if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &old_protect) == 0) continue;
+      g_flip_meter_sites.push_back({site, *site});
+      *site = static_cast<unsigned char>(want_value);
+      DWORD ignored = 0;
+      VirtualProtect(site, 1, old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), site, 1);
+    }
+  }
+
+  char module_path[MAX_PATH] = {};
+  GetModuleFileNameA(mod, module_path, MAX_PATH);
+
+  // Deriving the field is not the same as changing anything. If no site wrote
+  // the opposite value there was nothing to flip, and claiming success here
+  // would report a patch that never happened -- which is exactly how a stale
+  // DLL once looked like a working one.
+  if (g_flip_meter_sites.empty()) {
+    std::stringstream s;
+    s << "mfgunlock: flip-metering field +0x" << std::hex << want_offset << std::dec
+      << " derived from " << module_path << ", but no site writes the opposite value ("
+      << (1 - want_value) << ") -- nothing changed.";
+    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    g_flip_meter_attempts = kMaxFlipMeterAttempts;
+    return true;
+  }
+
+  g_flip_meter_offset.store(want_offset, std::memory_order_relaxed);
+  g_flip_meter_value.store(static_cast<unsigned int>(want_value), std::memory_order_relaxed);
+  g_flip_meter_patched.store(true, std::memory_order_release);
+
+  std::stringstream s;
+  s << "mfgunlock: forced flip-metering off in " << module_path << " -- field +0x" << std::hex
+    << want_offset << std::dec << " pinned to " << want_value << " at "
+    << g_flip_meter_sites.size() << " site(s); multi-frame should pace in software (RSYNC).";
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+
+  // Same module, and by now we know it is the right one.
+  if (g_raise_ceiling.load(std::memory_order_relaxed)) PatchFrameCountCeiling(mod);
+  return true;
+}
+
+void TryPatchFlipMetering() {
+  if (g_flip_meter_patched.load(std::memory_order_acquire)) return;
+  if (g_flip_meter_attempts >= kMaxFlipMeterAttempts) return;
+
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snap == INVALID_HANDLE_VALUE) return;
+
+  MODULEENTRY32W me = {};
+  me.dwSize = sizeof(me);
+  if (Module32FirstW(snap, &me)) {
+    do {
+      if (me.hModule == g_self_module) continue;
+      if (TryPatchFlipMeteringInModule(me.hModule)) break;
+    } while (Module32NextW(snap, &me));
+  }
+  CloseHandle(snap);
+}
+
+void RestoreFlipMetering() {
+  if (!g_flip_meter_patched.load(std::memory_order_acquire)) return;
+  for (const auto& site : g_flip_meter_sites) {
+    DWORD old_protect = 0;
+    if (VirtualProtect(site.address, 1, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
+      *site.address = site.original;
+      DWORD ignored = 0;
+      VirtualProtect(site.address, 1, old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), site.address, 1);
+    }
+  }
+  g_flip_meter_sites.clear();
+  g_flip_meter_patched.store(false, std::memory_order_release);
+}
+
+void OnPresent(reshade::api::command_queue* /*queue*/,
+               reshade::api::swapchain* /*swapchain*/,
+               const reshade::api::rect* /*source_rect*/,
+               const reshade::api::rect* /*dest_rect*/,
+               uint32_t /*dirty_rect_count*/,
+               const reshade::api::rect* /*dirty_rects*/) {
+  TryInstallHooks();
+  TryBootstrapVTable();
+  if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+  if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
+  if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+  mfgunlock::framecount::TryInstall();
+  mfgunlock::loadhook::TryInstall();
+}
+
+// The capability is computed once, early. Present is far too late: Streamline
+// came up 6.5s before our first present in testing, so the gate had already
+// been evaluated and the answer cached before we touched it. These fire as soon
+// as the game creates D3D objects, which is the earliest a ReShade addon can
+// act -- roughly 4.4s sooner. The patch itself is just a memory scan, so
+// running it on every one of these is cheap and idempotent.
+void OnInitDevice(reshade::api::device* /*device*/) {
+  if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+  if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
+  if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+  mfgunlock::framecount::TryInstall();
+  mfgunlock::loadhook::TryInstall();
+}
+
+void OnInitCommandQueue(reshade::api::command_queue* /*queue*/) {
+  if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+  if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
+  if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+  mfgunlock::framecount::TryInstall();
+  mfgunlock::loadhook::TryInstall();
+}
+
+// ---------------------------------------------------------------- overlay
+
+void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
+  bool enabled = g_enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Enable multi-frame override", &enabled)) {
+    g_enabled.store(enabled, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "Enabled", enabled ? 1 : 0);
+  }
+
+  int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
+  if (ImGui::SliderInt("Reported MultiFrameCountMax", &count,
+                       static_cast<int>(kMinCount), static_cast<int>(kMaxCount))) {
+    if (count < static_cast<int>(kMinCount)) count = static_cast<int>(kMinCount);
+    if (count > static_cast<int>(kMaxCount)) count = static_cast<int>(kMaxCount);
+    g_max_count.store(static_cast<unsigned int>(count), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "MaxCount", count);
+  }
+  ImGui::TextDisabled(
+      "Takes effect when DLSS-G next queries the runtime -- toggle frame\n"
+      "generation off and on in the game if the option does not appear.");
+
+  bool flip_off = g_force_flip_meter_off.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Force flip-metering off (needed for 3x/4x on Ada)", &flip_off)) {
+    g_force_flip_meter_off.store(flip_off, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", flip_off ? 1 : 0);
+  }
+  ImGui::TextDisabled("Applied once per session at load; restart the game to change it.");
+
+  ImGui::Separator();
+  if (g_flip_meter_patched.load(std::memory_order_acquire)) {
+    ImGui::Text("Flip-metering forced off: +0x%x pinned to %u, %zu site(s).",
+                g_flip_meter_offset.load(std::memory_order_relaxed),
+                g_flip_meter_value.load(std::memory_order_relaxed),
+                g_flip_meter_sites.size());
+  } else {
+    ImGui::TextDisabled("DLSS-G plugin not located yet (attempt %d).", g_flip_meter_attempts);
+  }
+
+  int force = static_cast<int>(
+      mfgunlock::framecount::g_force_multiplier.load(std::memory_order_relaxed));
+  // 6x == numFramesToGenerate 5, which is the Streamline plugin's own hard
+  // ceiling (its wrapper clamps the count to 5). Whether the runtime accepts it
+  // is up to that plugin -- a refusal is logged and falls back to the game's
+  // own request, so asking costs nothing.
+  if (ImGui::SliderInt("Force frame multiplier", &force, 0, 6,
+                       force == 0 ? "off (game decides)" : "%dx")) {
+    if (force != 0 && force < 2) force = 2;
+    mfgunlock::framecount::g_force_multiplier.store(static_cast<unsigned int>(force),
+                                                    std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ForceMultiplier", force);
+  }
+  ImGui::TextDisabled(
+      "Leave off for games with their own 2x/3x/4x selector -- forcing would\n"
+      "override your in-game choice. Use it where frame gen is only on/off.");
+  if (mfgunlock::framecount::g_intercepted.load(std::memory_order_relaxed)) {
+    ImGui::Text("Game asked for %ux, forced to %u generated frame(s).",
+                mfgunlock::framecount::g_last_requested.load(std::memory_order_relaxed) + 1,
+                mfgunlock::framecount::g_last_forced.load(std::memory_order_relaxed));
+  } else if (mfgunlock::framecount::g_declined_no_pacing.load(std::memory_order_relaxed)) {
+    ImGui::TextWrapped("Declined to force: flip metering was still on when DLSS-G started.");
+  } else if (mfgunlock::framecount::g_hooked.load(std::memory_order_acquire)) {
+    ImGui::TextDisabled("slDLSSGSetOptions hook installed; not exercised yet.");
+  } else {
+    ImGui::TextDisabled("sl.interposer.dll not hooked (no Streamline in this game?).");
+  }
+
+  ImGui::Separator();
+  bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Temporal fix (stops all frames landing at the midpoint)", &temporal)) {
+    g_temporal_fix.store(temporal, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "TemporalFix", temporal ? 1 : 0);
+  }
+  ImGui::TextDisabled("Applied once at load; restart the game to change it.");
+
+  ImGui::Separator();
+  if (g_midpoint_patched.load(std::memory_order_acquire)) {
+    ImGui::TextWrapped("Temporal fix: %s.", g_midpoint_detail.c_str());
+  } else {
+    ImGui::TextDisabled("Temporal fix not applied yet (attempt %d).", g_midpoint_attempts);
+  }
+
+  ImGui::Separator();
+  if (mfgunlock::loadhook::g_hooked.load(std::memory_order_acquire)) {
+    ImGui::Text("Load-time trigger armed (%u snippet load(s) caught).",
+                mfgunlock::loadhook::g_catches.load(std::memory_order_relaxed));
+  } else {
+    ImGui::TextDisabled("Load-time trigger not installed.");
+  }
+
+  ImGui::Separator();
+  if (g_gate_patched.load(std::memory_order_acquire)) {
+    ImGui::Text("nvngx_dlssg.dll arch gates rewritten: %zu site(s).", g_gate_sites.size());
+  } else {
+    ImGui::TextDisabled("DLSS-G snippet not located yet (attempt %d) -- enable frame generation.",
+                        g_gate_attempts);
+  }
+
+  ImGui::Separator();
+  if (!g_hooked.load(std::memory_order_acquire)) {
+    ImGui::Text("NGX loader: not hooked yet (attempt %d of %d)", g_hook_attempts,
+                kMaxHookAttempts);
+  } else if (!g_vtable_patched.load(std::memory_order_acquire)) {
+    ImGui::Text("NGX loader hooked; waiting for a parameter block.");
+  } else {
+    ImGui::Text("Parameter vtable patched. Overrides served: %u",
+                g_override_hits.load(std::memory_order_relaxed));
+    if (g_override_reported.load(std::memory_order_relaxed)) {
+      ImGui::Text("Runtime reported: %u", g_runtime_reported_value.load(std::memory_order_relaxed));
+    } else {
+      ImGui::TextDisabled("DLSS-G has not queried %s yet.", kParamName);
+    }
+  }
+}
+
+void LoadConfig() {
+  int value = 0;
+  if (reshade::get_config_value(nullptr, kConfigSection, "Enabled", value)) {
+    g_enabled.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "MaxCount", value)) {
+    if (value < static_cast<int>(kMinCount)) value = static_cast<int>(kMinCount);
+    if (value > static_cast<int>(kMaxCount)) value = static_cast<int>(kMaxCount);
+    g_max_count.store(static_cast<unsigned int>(value), std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", value)) {
+    g_force_flip_meter_off.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "TemporalFix", value)) {
+    g_temporal_fix.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "RaiseFrameCeiling", value)) {
+    g_raise_ceiling.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "ForceOTAPlugins", value)) {
+    mfgunlock::framecount::g_force_ota.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "ForceMultiplier", value)) {
+    if (value != 0 && (value < 2 || value > 6)) value = 0;
+    mfgunlock::framecount::g_force_multiplier.store(static_cast<unsigned int>(value),
+                                                    std::memory_order_relaxed);
+  }
+}
+
+}  // namespace
+
+extern "C" __declspec(dllexport) constexpr const char* NAME = "MFG Unlock";
+extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION =
+    "Reports DLSSG.MultiFrameCountMax so Streamline offers multi-frame generation";
+
+BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*/) {
+  switch (fdw_reason) {
+    case DLL_PROCESS_ATTACH:
+      g_self_module = h_module;
+      if (!reshade::register_addon(h_module)) return FALSE;
+      LoadConfig();
+      // Earliest possible attempt: if NGX already pulled the snippet in before
+      // ReShade got to us, this is the only shot we have at beating the
+      // capability query.
+      if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+      if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
+      if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+
+      // The frame-count override must never ask for more generated frames than
+      // the pacing can deliver, and it is the only code that runs at a moment
+      // when the DLSS-G plugin is guaranteed loaded. Give it both a way to
+      // force the pacing patch and a way to check whether it took.
+      mfgunlock::framecount::g_ensure_pacing = []() { TryPatchFlipMetering(); };
+      mfgunlock::framecount::g_pacing_ready = []() {
+        return g_flip_meter_patched.load(std::memory_order_acquire);
+      };
+      mfgunlock::framecount::TryInstall();
+  mfgunlock::loadhook::TryInstall();
+
+      // Additional, earlier trigger: catch the snippet as it is mapped, before
+      // NGX can populate its capabilities. Purely additive -- the present/init
+      // paths below are unchanged, and if this fails to install the games that
+      // already work are unaffected.
+      mfgunlock::loadhook::g_on_interposer_loaded = []() { mfgunlock::framecount::TryInstall(); };
+      mfgunlock::loadhook::g_on_dlssg_loaded = [](HMODULE mod) {
+        if (g_enabled.load(std::memory_order_relaxed)) PatchArchGatesInModule(mod);
+        if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
+      };
+      mfgunlock::loadhook::TryInstall();
+
+      reshade::register_overlay("MFG Unlock", OnRegisterOverlay);
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::register_event<reshade::addon_event::present>(OnPresent);
+      break;
+    case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::unregister_overlay("MFG Unlock", OnRegisterOverlay);
+      // Order matters: the vtable points into this image, so restore it before
+      // the module can be unloaded, then take the entry points back.
+      RestoreParameterVTable();
+      mfgunlock::loadhook::Uninstall();
+      mfgunlock::framecount::Uninstall();
+      RestoreMidpoint();
+      RestoreDlssgArchGate();
+      RestoreFrameCountCeiling();
+      RestoreFlipMetering();
+      if (g_hooked.load(std::memory_order_acquire)) {
+        mfgunlock::hook::Uninstall(kNgxHooks);
+      }
+      reshade::unregister_addon(h_module);
+      break;
+    default:
+      break;
+  }
+  return TRUE;
+}

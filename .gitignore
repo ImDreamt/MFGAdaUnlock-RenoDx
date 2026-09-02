@@ -1,0 +1,27 @@
+# Build output
+build/
+build.vs/
+out/
+*.addon64
+*.addon32
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.recipe
+
+# Never commit vendor binaries. This repo redistributes no NVIDIA files.
+*.dll
+nvngx_*
+sl.*.dll
+_nvngx*
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
