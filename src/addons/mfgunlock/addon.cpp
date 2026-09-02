@@ -655,7 +655,8 @@ constexpr char kFlipMarker[] = "FG1 DLL has been detected";
 
 struct FlipSite {
   unsigned char* address;
-  unsigned char original;
+  unsigned char original[7];
+  unsigned char length;
 };
 
 std::atomic_bool g_flip_meter_patched{false};
@@ -664,6 +665,25 @@ std::atomic<unsigned int> g_flip_meter_offset{0};
 std::atomic<unsigned int> g_flip_meter_value{0};
 int g_flip_meter_attempts = 0;
 constexpr int kMaxFlipMeterAttempts = 4000;
+
+// Records the original bytes before writing, so the instruction can be put back
+// exactly as it was. Patches here are either one byte (an immediate flipped in
+// place) or seven (a whole store rewritten), never anything else.
+bool WriteFlipSite(unsigned char* at, const unsigned char* bytes, size_t length) {
+  if (length == 0 || length > sizeof(FlipSite::original)) return false;
+  DWORD old_protect = 0;
+  if (VirtualProtect(at, length, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
+  FlipSite site = {};
+  site.address = at;
+  site.length = static_cast<unsigned char>(length);
+  std::memcpy(site.original, at, length);
+  g_flip_meter_sites.push_back(site);
+  std::memcpy(at, bytes, length);
+  DWORD ignored = 0;
+  VirtualProtect(at, length, old_protect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), at, length);
+  return true;
+}
 
 bool ModuleImage(HMODULE mod, unsigned char** out_base, const IMAGE_NT_HEADERS64** out_nt) {
   if (mod == nullptr) return false;
@@ -863,7 +883,22 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
     return true;
   }
 
-  // 3. Flip every site writing the opposite value to that same field.
+  // 3. Pin the field to that value everywhere it is written.
+  //
+  //    Two encodings appear in the wild, and sl.dlss_g 2.13.0.0 introduced the
+  //    second:
+  //
+  //      C6 /0 disp32 imm8    mov byte ptr [reg+disp32], imm8    (7 bytes)
+  //      40 88 /r  disp32     mov byte ptr [reg+disp32], reg8    (7 bytes)
+  //
+  //    The first is flipped by rewriting its immediate. The second stores a
+  //    runtime value, so there is no immediate to change -- but its REX prefix
+  //    is present only to name a byte register (spl/bpl/sil/dil), which makes it
+  //    exactly seven bytes: the same length as the C6 form with that same base
+  //    register. That equivalence is the only reason it is patchable in place,
+  //    so it is deliberately the only register store handled. A bare
+  //    88 /r disp32 is six bytes and a REX.B one needs eight, and rewriting
+  //    either would run past the end of the instruction.
   const unsigned char opposite = static_cast<unsigned char>(1 - want_value);
   section = IMAGE_FIRST_SECTION(nt);
   for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
@@ -872,21 +907,37 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
     const size_t size = section->Misc.VirtualSize;
     if (size < 7) continue;
     for (size_t off = 0; off + 7 <= size; ++off) {
-      if (start[off] != 0xC6) continue;
-      if (start[off + 1] < 0x80 || start[off + 1] > 0xBF) continue;
-      unsigned int field = 0;
-      std::memcpy(&field, start + off + 2, sizeof(field));
-      if (field != want_offset) continue;
-      if (start[off + 6] != opposite) continue;
+      // C6 /0 disp32 imm8 -- flip the immediate. Unchanged from the form that
+      // has been working; every other encoding is handled after it.
+      if (start[off] == 0xC6) {
+        if (start[off + 1] < 0x80 || start[off + 1] > 0xBF) continue;
+        unsigned int field = 0;
+        std::memcpy(&field, start + off + 2, sizeof(field));
+        if (field != want_offset) continue;
+        if (start[off + 6] != opposite) continue;
+        const unsigned char imm = static_cast<unsigned char>(want_value);
+        WriteFlipSite(start + off + 6, &imm, 1);
+        continue;
+      }
 
-      unsigned char* site = start + off + 6;
-      DWORD old_protect = 0;
-      if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &old_protect) == 0) continue;
-      g_flip_meter_sites.push_back({site, *site});
-      *site = static_cast<unsigned char>(want_value);
-      DWORD ignored = 0;
-      VirtualProtect(site, 1, old_protect, &ignored);
-      FlushInstructionCache(GetCurrentProcess(), site, 1);
+      // 40 88 /r disp32 -- rewrite the whole store into the C6 form, keeping the
+      // same base register. REX must be exactly 0x40: any of the B/R/X/W bits
+      // set would change either the encoding length or the base register.
+      if (start[off] != 0x40 || start[off + 1] != 0x88) continue;
+      const unsigned char modrm = start[off + 2];
+      if (modrm < 0x80 || modrm > 0xBF) continue;  // mod=10, disp32
+      const unsigned char rm = static_cast<unsigned char>(modrm & 7);
+      if (rm == 4) continue;                       // rm=100 means a SIB byte follows
+      unsigned int field = 0;
+      std::memcpy(&field, start + off + 3, sizeof(field));
+      if (field != want_offset) continue;
+
+      unsigned char replacement[7] = {0xC6, static_cast<unsigned char>(0x80 | rm),
+                                      0,    0,
+                                      0,    0,
+                                      static_cast<unsigned char>(want_value)};
+      std::memcpy(replacement + 2, &want_offset, sizeof(want_offset));
+      WriteFlipSite(start + off, replacement, sizeof(replacement));
     }
   }
 
@@ -900,8 +951,9 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
   if (g_flip_meter_sites.empty()) {
     std::stringstream s;
     s << "mfgunlock: flip-metering field +0x" << std::hex << want_offset << std::dec
-      << " derived from " << module_path << ", but no site writes the opposite value ("
-      << (1 - want_value) << ") -- nothing changed.";
+      << " derived from " << module_path
+      << ", but nothing writes it in a form this can patch -- no immediate store of "
+      << (1 - want_value) << ", and no 7-byte register store. Nothing changed.";
     reshade::log::message(reshade::log::level::warning, s.str().c_str());
     g_flip_meter_attempts = kMaxFlipMeterAttempts;
     return true;
@@ -944,11 +996,11 @@ void RestoreFlipMetering() {
   if (!g_flip_meter_patched.load(std::memory_order_acquire)) return;
   for (const auto& site : g_flip_meter_sites) {
     DWORD old_protect = 0;
-    if (VirtualProtect(site.address, 1, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
-      *site.address = site.original;
+    if (VirtualProtect(site.address, site.length, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
+      std::memcpy(site.address, site.original, site.length);
       DWORD ignored = 0;
-      VirtualProtect(site.address, 1, old_protect, &ignored);
-      FlushInstructionCache(GetCurrentProcess(), site.address, 1);
+      VirtualProtect(site.address, site.length, old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), site.address, site.length);
     }
   }
   g_flip_meter_sites.clear();
@@ -1026,8 +1078,17 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
                 g_flip_meter_offset.load(std::memory_order_relaxed),
                 g_flip_meter_value.load(std::memory_order_relaxed),
                 g_flip_meter_sites.size());
+  } else if (g_flip_meter_attempts >= kMaxFlipMeterAttempts) {
+    // The counter only advances once the plugin HAS been found, and both give-up
+    // paths slam it to the maximum -- so this state is "found it, could not patch
+    // it", which is the opposite of what this line used to say.
+    ImGui::TextDisabled("DLSS-G plugin found, but flip metering could not be patched.");
+    ImGui::TextDisabled("See the ReShade log for the module and the step that failed.");
+  } else if (g_flip_meter_attempts > 0) {
+    ImGui::TextDisabled("DLSS-G plugin found; flip-metering patch pending (%d).",
+                        g_flip_meter_attempts);
   } else {
-    ImGui::TextDisabled("DLSS-G plugin not located yet (attempt %d).", g_flip_meter_attempts);
+    ImGui::TextDisabled("DLSS-G plugin not located yet -- turn frame generation on.");
   }
 
   int force = static_cast<int>(
